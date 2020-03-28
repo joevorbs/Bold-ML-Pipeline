@@ -1,6 +1,4 @@
-
-
-#################################################
+################################################
 #Machine Learning Data Pipeline for Bold Data 
 #Work in Progress
 #################################################
@@ -60,8 +58,8 @@ df = results.to_dataframe()
 max_one_hot = 25       #Threshold for categorical data
 min_numerical = 300    #Threshold for numerical data
 amt_to_sample = 100    #Numer of rows to sample
-split_ratio = .25      #Ratio for train/hold
-dep_var =  "engage_ind"          #Target for model - example case
+test_size = .25      #Ratio for train/holdout 
+dep_var =  "quit_ind"
 scaling_method = MinMaxScaler()  #Method for Scaling (MinMax, Standard, Etc.)
 seed = 1994
 
@@ -72,8 +70,19 @@ seed = 1994
 
 
 #Create DV - example case
-df[dep_var] = df.apply(lambda row: 1 if row['event_name'] == 'user_engagement' else 0, axis = 1)
+#Users who only use the app for one month - people who dont stay with the app - past 90 days of data
+df_dv = df[['user_pseudo_id','event_date']]
+df_dv['event_date'] = df_dv['event_date'].astype(str).str[:-2].astype(int)
+df_dv = pd.DataFrame(df_dv.groupby('user_pseudo_id')['event_date'].nunique()).rename(columns = {"event_date" : "counter"})
+df_dv = df_dv.reset_index()
+df_dv = df_dv[df_dv.counter == 1]
 
+df = df.merge(df_dv, on = 'user_pseudo_id', how = 'left')
+
+df[dep_var] = df.apply(lambda x: 1 if x['counter'] > 0 else 0, axis = 1)
+df.drop('counter', axis = 1, inplace = True) 
+
+df = df[(df['event_date'].astype(int) >= 20191229) & (df['event_date'].astype(int) <= 20200328)]
 
 #########################################
 #TURN COLS WITH DICTS INTO SEPARATE COLS
@@ -116,13 +125,14 @@ for col in df_cleaned_1.columns:  #Loop through columns
 
 
 #Create dataframe of just dates
-#Add column from original dataframe, no need to calculate event time differences
+#Add column from original dataframe,
 df_dates = df_cleaned_1[datetimes_list]
 df_dates['event_previous_timestamp'] = df['event_previous_timestamp']
+df_dates['event_timestamp'] = df['event_timestamp']
 
 #Create column for time between last event and previous
 df_dates['event_time_diff'] = df_dates['event_timestamp'] - df_dates['event_previous_timestamp']
-#Impute 0 for nulls in the case that there isnt a previous event to compare to
+#Impute 0 for nulls in the case that there isnt a previous event to compare too
 df_dates['event_time_diff'] = df_dates['event_time_diff'].fillna(0)
 
 ####################################
@@ -137,7 +147,10 @@ numerical = list()
 single_value = list()
 all_na = list()
 
-for col in df_cleaned_1.drop(datetimes_list, axis=1):
+
+date_filter = list(df_dates.columns)
+
+for col in df_cleaned_1.drop(date_filter, axis=1):
     try:
         col_count_dist = df_cleaned_1[col].nunique()
         if col_count_dist == 0:
@@ -157,6 +170,7 @@ for col in df_cleaned_1.drop(datetimes_list, axis=1):
 df_low_card = df_cleaned_1[low_card]
 df_high_card = df_cleaned_1[high_card]
 df_numerical = df_cleaned_1[numerical]
+
 
 #####################
 #IDENTIFY BINARY COLS
@@ -248,7 +262,7 @@ df_true_high_card[dep_var] = df[dep_var]
 
 
 #Create train/test datasets for encoding
-te_train, te_test = train_test_split(df_true_high_card, test_size = split_ratio, random_state = seed)
+te_train, te_test = train_test_split(df_true_high_card, test_size = test_size, random_state = seed)
 
 
 #Turn train and test set into h2o frames
@@ -309,26 +323,26 @@ all_to_high_card = pd.concat([dates_binary_low_to_num, df_high_card_te], axis = 
 df_converted = h2o.H2OFrame(all_to_high_card)
 
 #Create train/holdout sets
-df_test, df_train = df_converted.split_frame(ratios = [split_ratio], seed = seed)
+df_test, df_train = df_converted.split_frame(ratios = [test_size], seed = seed)
 
-#Isolate IVs - drop event_name as its target leakage (just for example here)
+#Isolate IVs
 features = df_test.columns
-del features[-4]
 
 #Lasso Regression
-glm = H2OGeneralizedLinearEstimator(family= "binomial", lambda_ = .00015, alpha = 1)
+glm = H2OGeneralizedLinearEstimator(family= "binomial", lambda_ = .00005, alpha = 1)
 glm.train(features, dep_var, training_frame = df_train)
 
-#Confusion Matrix
-glm.confusion_matrix()
+#Coefficients
+glm._model_json['output']['coefficients_table'].as_data_frame().sort_values(by='standardized_coefficients', ascending = False)
+#Top Coefficients
+glm.varimp_plot()
 
-#AUC
-glm.auc()
+#Test set performance - ROC Curve and Predictions
+model_perf = glm.model_performance(df_test)
+model_perf.plot(type = "roc")
+model_perf
 
-#Test set performance
-preds = glm.predict(df_test)
-glm.model_performance(df_test)
+preds_by_row = glm.predict(df_test).as_data_frame()
 
 #Close H2O
 h2o.cluster().shutdown()
-
